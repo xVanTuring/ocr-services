@@ -32,6 +32,16 @@ die() { echo "错误：$*" >&2; exit 1; }
 
 is_loaded() { launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; }
 
+# bootout 返回时进程可能还在退出（等待请求收尾），此时立刻 bootstrap 会失败或被误判为仍在运行。
+wait_unloaded() {
+  local _
+  for _ in $(seq 1 100); do
+    is_loaded || return 0
+    sleep 0.2
+  done
+  die "等待 20 秒后服务仍未卸载"
+}
+
 render_plist() {
   # HF_HUB_OFFLINE=1：launchd 不继承终端里的代理变量，联网检查 HuggingFace 会卡住；
   # 权重必须已经下载好（见 check_ready）。
@@ -93,6 +103,7 @@ cmd_install() {
   mkdir -p "$LOG_DIR" "$(dirname "$PLIST")"
   if is_loaded; then
     launchctl bootout "$DOMAIN/$LABEL" || true
+    wait_unloaded
   fi
   render_plist >"$PLIST"
   plutil -lint "$PLIST" >/dev/null || die "生成的 plist 不合法：$PLIST"
@@ -125,6 +136,7 @@ cmd_stop() {
     return
   fi
   launchctl bootout "$DOMAIN/$LABEL"
+  wait_unloaded
   echo "已停止（下次登录或执行 start 时会再启动）"
 }
 

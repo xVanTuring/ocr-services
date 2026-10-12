@@ -69,6 +69,20 @@ def test_job_without_word_boxes_omits_them() -> None:
     assert "text_word" not in pruned
 
 
+def test_dashboard_lists_jobs() -> None:
+    with TestClient(create_app(StubOCR, idle_seconds=0)) as client:  # type: ignore[arg-type]
+        assert "OCR Service" in client.get("/").text
+        _run(client, {})
+        client.post(JOB_PATH, files={"file": ("bad.png", io.BytesIO(b"x"), "image/png")})
+        stats = client.get("/api/stats").json()
+
+    assert stats["total"] == 2 and stats["failed"] == 1
+    failed, done = stats["jobs"]
+    assert failed["state"] == "failed" and failed["filename"] == "bad.png"
+    assert done["state"] == "done" and done["text_count"] == 1
+    assert done["width"] == 120 and "payload" not in done
+
+
 def test_unknown_job_is_404() -> None:
     with TestClient(create_app(StubOCR, idle_seconds=0)) as client:  # type: ignore[arg-type]
         assert client.get(f"{JOB_PATH}/nope").status_code == 404
