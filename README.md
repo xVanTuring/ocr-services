@@ -63,6 +63,7 @@ Environment variables. For the background service they are written into the plis
 | `OCR_PORT` | `8766` | Port |
 | `OCR_VARIANT` | `medium` | Model variant |
 | `OCR_IDLE_SECONDS` | `300` | Seconds of inactivity before the model is unloaded; `0` keeps it loaded |
+| `OCR_MAX_PENDING` | `32` | Maximum queued jobs; further submissions get HTTP 503 |
 
 ## Web dashboard
 

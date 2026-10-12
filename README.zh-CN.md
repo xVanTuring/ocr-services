@@ -63,6 +63,7 @@ git clone --recurse-submodules https://github.com/xVanTuring/ocr-services.git
 | `OCR_PORT` | `8766` | 端口 |
 | `OCR_VARIANT` | `medium` | 模型变体 |
 | `OCR_IDLE_SECONDS` | `300` | 空闲多少秒后卸载模型，`0` 表示不卸载 |
+| `OCR_MAX_PENDING` | `32` | 最多排队的任务数，超过返回 503 |
 
 ## Web 面板
 

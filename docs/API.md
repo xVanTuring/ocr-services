@@ -9,10 +9,10 @@
 | 默认地址 | `http://127.0.0.1:8766` |
 | 认证 | 无。`Authorization` 头会被忽略，不需要 API key |
 | 监听范围 | 默认只监听本机（`127.0.0.1`），不要直接暴露到局域网或公网 |
-| 并发 | 识别是串行的：同一时刻只处理一张图，其余请求排队 |
+| 并发 | 识别是串行的：同一时刻只处理一张图，其余任务排队（最多 32 个，满了提交返回 503）。识别期间其他接口不受影响 |
 | 平台 | 仅 Apple Silicon 的 macOS |
 
-流程三步：**提交图片 → 查询任务状态 → 下载结果**。本服务在提交请求里就同步完成识别，所以提交返回时任务已经是 `done`，查询一次即可拿到结果地址。
+流程三步：**提交图片 → 轮询任务状态 → 下载结果**。提交只是把任务放进队列并立刻返回 `jobId`，识别在后台进行；需要轮询到 `done` 才能拿到结果地址。
 
 ```
 POST /api/v2/ocr/jobs                    →  {"data":{"jobId":"…"}}
@@ -57,11 +57,20 @@ GET  /api/v2/ocr/jobs/{jobId}/result.jsonl →  识别结果（JSONL）
 }
 ```
 
-`state` 恒为 `done`（没有 `pending`、`running`、`failed`）。识别出错时，错误直接在提交请求里返回（见第 4 节）。`jobId` 不存在返回 404。
+`state` 取值：
+
+| 值 | 含义 | 响应里的其他字段 |
+|---|---|---|
+| `pending` | 排队中 | 无 |
+| `running` | 正在识别 | 无 |
+| `done` | 完成 | `resultUrl.jsonUrl` |
+| `failed` | 识别出错（例如模型加载失败） | `errorMsg` |
+
+`jobId` 不存在返回 404。
 
 ### 2.3 下载结果 `GET /api/v2/ocr/jobs/{jobId}/result.jsonl`
 
-`Content-Type: application/x-ndjson`。内容只有一行 JSON，结构见第 3 节。`jobId` 不存在返回 404。
+`Content-Type: application/x-ndjson`。内容只有一行 JSON，结构见第 3 节。`jobId` 不存在返回 404。任务还没完成（或已失败）时返回 409。
 
 ### 2.4 健康检查 `GET /healthz`
 
@@ -158,7 +167,10 @@ for text, box in zip(page["rec_texts"], page["rec_boxes"]):
 | 400 | 提交 | 图片无法解码（`cannot decode image`），或 `optionalPayload` 不是合法 JSON |
 | 404 | 查询、下载 | 任务不存在（`unknown job`）。任务结果只保存在内存里，**最多保留最近 64 个**，服务重启后全部丢失 |
 | 422 | 提交 | 缺少 `file` 字段等参数校验错误 |
-| 500 | 提交 | 识别过程出错（例如模型加载失败），详见服务端日志 |
+| 409 | 下载 | 任务还在排队、识别中，或已失败 |
+| 503 | 提交 | 排队的任务太多（默认上限 32），响应带 `Retry-After: 5`，稍后重试 |
+
+识别过程出错不会让提交失败，而是任务状态变成 `failed`（`errorMsg` 里有原因，详细堆栈见服务端日志）。
 
 建议提交成功后立即取结果，不要长期保存 `jobId`。
 
@@ -181,6 +193,7 @@ Python（`httpx`）：
 
 ```python
 import json
+import time
 import httpx
 
 BASE = "http://127.0.0.1:8766"
@@ -197,8 +210,13 @@ def recognize(png_path: str, word_boxes: bool = True) -> dict:
         r.raise_for_status()
         job_id = r.json()["data"]["jobId"]
 
-        status = client.get(f"{BASE}/api/v2/ocr/jobs/{job_id}").json()["data"]
-        assert status["state"] == "done"
+        while True:
+            status = client.get(f"{BASE}/api/v2/ocr/jobs/{job_id}").json()["data"]
+            if status["state"] in ("done", "failed"):
+                break
+            time.sleep(0.5)
+        if status["state"] == "failed":
+            raise RuntimeError(status["errorMsg"])
         body = client.get(status["resultUrl"]["jsonUrl"]).text
     return json.loads(body.splitlines()[0])["result"]["ocrResults"][0]["prunedResult"]
 ```
@@ -209,17 +227,17 @@ def recognize(png_path: str, word_boxes: bool = True) -> dict:
 
 1. 把任务地址改成 `http://127.0.0.1:8766/api/v2/ocr/jobs`。
 2. 不再要求 API key，`Authorization` 头可以不发，发了也不会报错。
-3. 轮询逻辑可以保留。第一次查询就是 `done`。
-4. **请求超时设宽松（建议不少于 60 秒）**，原因见第 7 节。
+3. 轮询逻辑保留，并处理 `pending`、`running`、`failed` 三种状态。
+4. 首次任务要等模型加载，**总等待时间设宽松（建议不少于 60 秒）**，原因见第 7 节。
 5. 结果解析（`rec_texts`、`rec_boxes`、`text_word`、`text_word_boxes`、`width`、`height`）不用改。
 6. 缓存键里的识别引擎标识要和云端区分开，两边的识别结果不会完全一致，混用同一个标识会让缓存里的结果来源不明。
 
 ## 7. 性能与资源
 
-- **首次请求较慢**：模型是按需加载的，服务启动时不占用模型内存。第一次提交会包含模型加载时间，请把超时设宽松。之后的识别只需要推理时间。
+- **首次任务较慢**：模型是按需加载的，服务启动时不占用模型内存。第一个任务会包含模型加载时间，请把等待时间设宽松。之后的识别只需要推理时间。
 - **空闲自动卸载**：连续 300 秒（默认）没有请求，模型会从内存卸载；下一次请求再加载，所以空闲之后的第一次请求会再慢一次。
 - **内存**：加载后进程约占 0.8GB；卸载后会降到约 0.6GB 而不是回到启动时的约 0.1GB，这部分是运行库自身的占用，进程不退出就不会还回去。
-- 请求之间严格串行，识别期间新请求会排队等待，不会并行加速。
+- 任务之间严格串行，识别在专用线程里进行；提交、查询和面板不会被识别阻塞，但多个任务不会并行加速。
 
 ## 8. 服务端配置
 
@@ -231,6 +249,7 @@ def recognize(png_path: str, word_boxes: bool = True) -> dict:
 | `OCR_PORT` | `8766` | 监听端口 |
 | `OCR_VARIANT` | `medium` | 模型规格：`tiny`、`small`、`medium`。越大越准也越慢 |
 | `OCR_IDLE_SECONDS` | `300` | 空闲多久后卸载模型；`0` 表示永不卸载 |
+| `OCR_MAX_PENDING` | `32` | 最多排队的任务数，超过返回 503 |
 
 ## 9. 协议
 
